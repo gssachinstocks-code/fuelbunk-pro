@@ -743,99 +743,101 @@ try {
 } catch(e) {}
 </script>
 <script>
-/* CLOUD API ADAPTER v5 */
+/* CLOUD API ADAPTER v6 */
 /**
- * FuelBunk Pro — Cloud API Adapter v5
+ * FuelBunk Pro — Cloud API Adapter v6 (CLEAN REWRITE)
  *
- * THE ACTUAL FIX:
- * app.js defines `async function initApp()` which overwrites our
- * window.initApp assignment. All previous patching failed because of this.
+ * Approach: No pre-boot data fetching (that caused the APP undefined error).
+ * Instead use targeted patches applied AFTER app.js finishes parsing.
  *
- * Solution: Override document.addEventListener SYNCHRONOUSLY at parse time.
- * When app.js registers its DOMContentLoaded callback, we intercept it and
- * wrap it — our bootstrap runs first (seeds localStorage from server),
- * then app.js's initApp runs with real tenant data already in localStorage.
+ * What this does:
+ * 1. [Parse time]     Override window.FuelDB → CloudDB (all db writes go to server)
+ * 2. [DOMContentLoaded intercept] ONLY seed fb_tenants from server (no data fetch)
+ * 3. [setTimeout after parse] Patch:
+ *      - loadData()         → fetch from /api/data (called by initApp AFTER APP exists)
+ *      - doAdminLogin()     → authenticate against server
+ *      - mt_doSuperLogin()  → authenticate super admin against server + sync stations
+ *      - mt_saveTenant()    → save new/edited stations to server
  */
 
 'use strict';
 
-const IS_CLOUD = location.protocol === 'https:' || location.protocol === 'http:';
-if (!IS_CLOUD) { console.info('[FuelBunk] Local file mode — cloud adapter inactive'); }
+const IS_CLOUD = (location.protocol === 'https:' || location.protocol === 'http:')
+                 && location.hostname !== 'localhost'
+                 && location.hostname !== '127.0.0.1';
 
-// ── Token ──────────────────────────────────────────────────────
+if (!IS_CLOUD) { console.info('[Cloud] Local mode — adapter inactive'); }
+
+// ─── Token ─────────────────────────────────────────────────────
 const Token = {
   KEY: 'fb_cloud_jwt',
   get()   { try { return localStorage.getItem(this.KEY); }     catch { return null; } },
   set(t)  { try { localStorage.setItem(this.KEY, t); }         catch {} },
   clear() { try { localStorage.removeItem(this.KEY); }         catch {} },
-  headers() {
-    const t = this.get();
-    return { 'Content-Type': 'application/json',
-             ...(t ? { Authorization: 'Bearer ' + t } : {}) };
-  }
+  hdrs()  { const t = this.get();
+             return { 'Content-Type': 'application/json',
+                      ...(t ? { Authorization: 'Bearer ' + t } : {}) }; }
 };
 
-// ── API fetch ──────────────────────────────────────────────────
-async function apiFetch(method, path, body) {
+// ─── API helper ────────────────────────────────────────────────
+async function api(method, path, body) {
   const r = await fetch(path, {
-    method,
-    headers: Token.headers(),
+    method, headers: Token.hdrs(),
     ...(body !== undefined ? { body: JSON.stringify(body) } : {})
   });
   if (!r.ok) {
-    let msg;
-    try { msg = (await r.json()).error; } catch { msg = r.status; }
-    throw new Error(msg || String(r.status));
+    let msg = r.status;
+    try { msg = (await r.json()).error || msg; } catch {}
+    throw new Error(String(msg));
   }
   return r.json();
 }
 
-// ── CloudDB ────────────────────────────────────────────────────
+// ─── CloudDB ───────────────────────────────────────────────────
 class CloudDB {
   constructor() { this.db = true; this.ready = Promise.resolve(); }
 
   _arr(s) {
     const d = window.APP?.data; if (!d) return null;
-    const m = { tanks:'tanks', pumps:'pumps', sales:'sales', employees:'employees',
-                shifts:'shifts', creditCustomers:'creditCustomers', expenses:'expenses',
-                fuelPurchases:'fuelPurchases', dipReadings:'dipReadings' };
+    const m = { tanks:'tanks',pumps:'pumps',sales:'sales',employees:'employees',
+                shifts:'shifts',creditCustomers:'creditCustomers',expenses:'expenses',
+                fuelPurchases:'fuelPurchases',dipReadings:'dipReadings' };
     return d[m[s]] || null;
   }
-  _up(s,v) { const a=this._arr(s); if(!a) return; const i=a.findIndex(r=>r.id===v.id); if(i>=0) a[i]={...a[i],...v}; else a.unshift(v); }
-  _in(s,v) { const a=this._arr(s); if(a) a.unshift(v); }
-  _rm(s,k) { const a=this._arr(s); if(!a) return; const i=a.findIndex(r=>r.id===k); if(i>=0) a.splice(i,1); }
+  _up(s,v){ const a=this._arr(s);if(!a)return;const i=a.findIndex(r=>r.id===v.id);if(i>=0)a[i]={...a[i],...v};else a.unshift(v); }
+  _in(s,v){ const a=this._arr(s);if(a)a.unshift(v); }
+  _rm(s,k){ const a=this._arr(s);if(!a)return;const i=a.findIndex(r=>r.id===k);if(i>=0)a.splice(i,1); }
 
-  async getAll(s) {
-    if (s==='settings') { const d=window.APP?.data; if(!d) return []; return Object.entries(d.settings||{}).map(([k,v])=>({key:k,value:v})); }
-    if (s==='auditLog') return window.APP?.auditLog||[];
+  async getAll(s){
+    if(s==='settings'){const d=window.APP?.data;if(!d)return[];return Object.entries(d.settings||{}).map(([k,v])=>({key:k,value:v}));}
+    if(s==='auditLog')return window.APP?.auditLog||[];
     return this._arr(s)||[];
   }
-  async get(s,k) {
-    if (s==='settings') { const v=window.APP?.data?.settings?.[k]; return v!==undefined?{key:k,value:v}:null; }
-    const a=this._arr(s); return a?(a.find(r=>r.id===k)||null):null;
+  async get(s,k){
+    if(s==='settings'){const v=window.APP?.data?.settings?.[k];return v!==undefined?{key:k,value:v}:null;}
+    const a=this._arr(s);return a?(a.find(r=>r.id===k)||null):null;
   }
-  async put(s,v)    { this._up(s,v);  this._push(s,v,'put');    return v.id; }
-  async add(s,v)    { this._in(s,v);  this._push(s,v,'add');    return v.id; }
-  async delete(s,k) { this._rm(s,k);  this._drop(s,k); }
-  async clear()     {}
-  async count(s)    { return (await this.getAll(s)).length; }
-  async bulkPut(s,items) {
+  async put(s,v)   { this._up(s,v); this._send(s,v,'put'); return v.id; }
+  async add(s,v)   { this._in(s,v); this._send(s,v,'add'); return v.id; }
+  async delete(s,k){ this._rm(s,k); this._del(s,k); }
+  async clear(){}
+  async count(s){ return (await this.getAll(s)).length; }
+  async bulkPut(s,items){
     items.forEach(v=>this._up(s,v));
-    if (s==='sales') apiFetch('POST','/api/sales/batch',{sales:items}).catch(()=>{});
-    else items.forEach(v=>this._push(s,v,'put'));
+    if(s==='sales') api('POST','/api/sales/batch',{sales:items}).catch(()=>{});
+    else items.forEach(v=>this._send(s,v,'put'));
   }
-  async getByIndex(s,idx,val) { return (await this.getAll(s)).filter(r=>r[idx]===val); }
-  async getSetting(k,def=null) {
-    const v=window.APP?.data?.settings?.[k]; if(v!==undefined) return v;
-    try { const r=await apiFetch('GET','/api/settings/'+encodeURIComponent(k)); return r?.value??def; } catch { return def; }
+  async getByIndex(s,idx,val){return(await this.getAll(s)).filter(r=>r[idx]===val);}
+  async getSetting(k,def=null){
+    const v=window.APP?.data?.settings?.[k];if(v!==undefined)return v;
+    try{const r=await api('GET','/api/settings/'+encodeURIComponent(k));return r?.value??def;}catch{return def;}
   }
-  async setSetting(k,v) {
-    if(window.APP?.data?.settings) window.APP.data.settings[k]=v;
-    apiFetch('PUT','/api/settings/'+encodeURIComponent(k),{value:v}).catch(()=>{});
+  async setSetting(k,v){
+    if(window.APP?.data?.settings)window.APP.data.settings[k]=v;
+    api('PUT','/api/settings/'+encodeURIComponent(k),{value:v}).catch(()=>{});
   }
-
-  _push(s,v,op) {
-    const R = {
+  _send(s,v,op){
+    const R={
       tanks:          op==='add'?['/api/tanks','POST']          :['/api/tanks/'+v.id,'PUT'],
       pumps:          op==='add'?['/api/pumps','POST']          :['/api/pumps/'+v.id,'PUT'],
       employees:      op==='add'?['/api/employees','POST']      :['/api/employees/'+v.id,'PUT'],
@@ -848,25 +850,25 @@ class CloudDB {
       auditLog:       ['/api/audit','POST'],
       settings:       ['/api/settings/'+encodeURIComponent(v?.key||''),'PUT'],
     };
-    const r=R[s]; if(!r) return;
-    const body = s==='auditLog'?{action:v.action,details:v} : s==='settings'?{value:v.value} : v;
-    apiFetch(r[1],r[0],body).catch(e=>console.warn('[CloudDB]',s,e.message));
+    const r=R[s];if(!r)return;
+    const body=s==='auditLog'?{action:v.action,details:v}:s==='settings'?{value:v.value}:v;
+    api(r[1],r[0],body).catch(e=>console.warn('[DB]',s,e.message));
   }
-  _drop(s,k) {
+  _del(s,k){
     const m={tanks:'/api/tanks/',pumps:'/api/pumps/',employees:'/api/employees/',
              creditCustomers:'/api/credit_customers/',expenses:'/api/expenses/'};
-    if(m[s]) apiFetch('DELETE',m[s]+k).catch(()=>{});
+    if(m[s])api('DELETE',m[s]+k).catch(()=>{});
   }
 }
 
-// Override FuelDB class before app.js instantiates it
+// Override FuelDB before app.js runs
 if (IS_CLOUD) window.FuelDB = CloudDB;
 
-// ── Load all data from /api/data into APP.data ─────────────────
-// Stores result in window._cloudPendingData if APP not ready yet.
+// ─── Load all data from server into APP.data ───────────────────
 async function cloudLoad() {
-  const d = await apiFetch('GET', '/api/data');
-  const appData = {
+  if (!window.APP) throw new Error('APP not ready');
+  const d = await api('GET', '/api/data');
+  window.APP.data = {
     tanks:           d.tanks           || [],
     pumps:           d.pumps           || [],
     shifts:          d.shifts          || [],
@@ -876,7 +878,7 @@ async function cloudLoad() {
     expenses:        (d.expenses       || []).sort((a,b)=>b.id-a.id),
     fuelPurchases:   (d.fuelPurchases  || []).sort((a,b)=>b.id-a.id),
     dipReadings:     (d.dipReadings    || []).sort((a,b)=>b.id-a.id),
-    prices:          d.prices          || window.SEED?.prices         || {},
+    prices:          d.prices          || window.SEED?.prices || {},
     purchasePrices:  d.purchasePrices  || window.SEED?.purchasePrices || {},
     upiVPA:          d.settings?.upiVPA     || d.tenant?.upi_vpa     || '',
     upiName:         d.settings?.upiName    || d.tenant?.name        || '',
@@ -886,205 +888,216 @@ async function cloudLoad() {
     weekly: [],
     settings: d.settings || {},
   };
-  // Store pending — applied now if APP ready, or by patched loadData() later
-  window._cloudPendingData   = appData;
-  window._cloudPendingTenant = d.tenant || null;
-  if (window.APP) {
-    window.APP.data     = appData;
-    window.APP.auditLog = [];
-    if (d.tenant) window.APP.tenant = { ...(window.APP.tenant||{}), ...d.tenant };
-  }
-  console.info('[Cloud] Data loaded — tanks:', d.tanks?.length, 'sales:', d.sales?.length);
+  window.APP.auditLog = [];
+  if (d.tenant) window.APP.tenant = { ...(window.APP.tenant||{}), ...d.tenant };
+  console.info('[Cloud] Loaded — tanks:', d.tanks?.length, 'sales:', d.sales?.length);
 }
 
-// ── Auto-refresh every 60s ─────────────────────────────────────
-function startAutoRefresh() {
+// ═══════════════════════════════════════════════════════════════
+// STEP 1 — Intercept DOMContentLoaded to seed localStorage ONLY
+// (no data fetch here — APP doesn't exist yet)
+// ═══════════════════════════════════════════════════════════════
+if (IS_CLOUD) {
+  const _orig = document.addEventListener.bind(document);
+  document.addEventListener = function(type, listener, opts) {
+    if (type === 'DOMContentLoaded') {
+      document.addEventListener = _orig; // restore immediately
+      _orig(type, async function(e) {
+        // ── Seed tenant list from server ──────────────────────
+        try {
+          const list = await api('GET', '/api/tenants/public');
+          if (list?.length) {
+            const mapped = list.map(t => ({
+              id: t.id, name: t.name, location: t.location||'',
+              omc: t.omc||'', icon:'⛽', color:'#d4940f',
+              colorLight:'#f7cc6b', active: t.is_active!==0,
+              adminUsers:[{id:1,name:'Admin',username:'_server_',passHash:'',role:'Owner'}],
+            }));
+            localStorage.setItem('fb_tenants', JSON.stringify(mapped));
+            if (mapped.length === 1)
+              localStorage.setItem('fb_active_tenant', JSON.stringify(mapped[0]));
+            console.info('[Cloud] Seeded', mapped.length, 'station(s)');
+          }
+        } catch(e) { console.warn('[Cloud] Tenant seed failed:', e.message); }
+
+        // ── Restore JWT session if token exists ───────────────
+        if (Token.get()) {
+          try {
+            const payload = JSON.parse(atob(Token.get().split('.')[1]));
+            const exp = payload.exp * 1000;
+            if (Date.now() > exp) { Token.clear(); console.info('[Cloud] Token expired'); }
+            else {
+              // Ensure active tenant is set
+              if (!localStorage.getItem('fb_active_tenant')) {
+                const tenants = JSON.parse(localStorage.getItem('fb_tenants')||'[]');
+                const t = tenants.find(x => x.id === payload.tenantId) || tenants[0];
+                if (t) localStorage.setItem('fb_active_tenant', JSON.stringify(t));
+              }
+              window._cloudJwtPayload = payload;
+              console.info('[Cloud] Valid JWT found for', payload.name);
+            }
+          } catch(e) { Token.clear(); }
+        }
+
+        // ── Now run app.js's DOMContentLoaded → initApp() ─────
+        listener(e);
+
+      }, opts);
+      return;
+    }
+    _orig(type, listener, opts);
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// STEP 2 — After app.js finishes parsing, patch its functions
+// Using window.addEventListener('load') ensures all scripts done
+// ═══════════════════════════════════════════════════════════════
+window.addEventListener('load', function() {
+  if (!IS_CLOUD) return;
+
+  // ── Patch loadData() ────────────────────────────────────────
+  // Called by initApp() after APP is created — safe to use window.APP here
+  window.loadData = async function() {
+    if (!Token.get()) return; // no token → normal login screen
+    try {
+      await cloudLoad();
+      console.info('[Cloud] loadData() → server data applied');
+    } catch(e) {
+      console.warn('[Cloud] loadData failed:', e.message);
+      Token.clear();
+    }
+  };
+
+  // ── Patch doAdminLogin() ────────────────────────────────────
+  window.doAdminLogin = async function() {
+    const u = (document.getElementById('adminUser')?.value||'').trim().toLowerCase();
+    const p = document.getElementById('adminPass')?.value||'';
+    if (!u || !p) { window.toast?.('Enter credentials','error'); return; }
+
+    const tenant = window.mt_getActiveTenant?.();
+    if (!tenant?.id) { window.toast?.('Select a station first','error'); return; }
+
+    const btn = document.querySelector('.login-btn, button[onclick*="doAdminLogin"]');
+    if (btn) { btn.disabled=true; btn.textContent='Signing in...'; }
+
+    try {
+      const r = await api('POST', '/api/auth/login',
+                          { tenantId: tenant.id, username: u, password: p });
+      Token.set(r.token);
+      await cloudLoad();
+
+      window.APP.loggedIn  = true;
+      window.APP.role      = 'admin';
+      window.APP.adminUser = { id:r.user.id, name:r.user.name, role:r.user.role };
+      window.APP.tenant    = { ...tenant, ...r.tenant };
+      window.saveSession?.();
+      window.enterApp?.();
+      window.toast?.('Welcome '+r.user.name+'!', 'success');
+
+    } catch(e) {
+      const msg = e.message.toLowerCase().includes('invalid')
+        ? 'Invalid username or password' : e.message;
+      window.toast?.(msg, 'error');
+      if (btn) { btn.disabled=false; btn.textContent='Login'; }
+    }
+  };
+
+  // ── Patch mt_doSuperLogin() ─────────────────────────────────
+  // Auth against server + sync any local stations up to server
+  const _origSuperLogin = window.mt_doSuperLogin;
+  window.mt_doSuperLogin = async function() {
+    const u = (document.getElementById('superUser')?.value||'').trim().toLowerCase();
+    const p = document.getElementById('superPass')?.value||'';
+    if (!u || !p) { window.mt_toast?.('Enter credentials','error'); return; }
+
+    try {
+      const r = await api('POST', '/api/super/login', { username: u, password: p });
+      // Store super admin JWT
+      localStorage.setItem('fb_super_cloud_jwt', r.token);
+      window.mt_toast?.('Super Admin logged in','success');
+
+      // Sync any stations from localStorage to server
+      const localTenants = JSON.parse(localStorage.getItem('fb_tenants')||'[]');
+      for (const t of localTenants) {
+        if (!t.id || t.id === 'demo_station') continue;
+        try {
+          await api('POST', '/api/super/stations',
+            { token: r.token, tenant: t });
+          console.info('[Cloud] Synced station to server:', t.name);
+        } catch(se) { console.warn('[Cloud] Station sync failed:', t.name, se.message); }
+      }
+
+      // Refresh station list from server
+      const list = await api('GET', '/api/tenants/public');
+      if (list?.length) {
+        const mapped = list.map(t => ({
+          id:t.id, name:t.name, location:t.location||'', omc:t.omc||'',
+          icon:'⛽', color:'#d4940f', colorLight:'#f7cc6b', active:t.is_active!==0,
+          adminUsers:[{id:1,name:'Admin',username:'_server_',passHash:'',role:'Owner'}],
+        }));
+        localStorage.setItem('fb_tenants', JSON.stringify(mapped));
+      }
+
+      // Use existing session mechanism
+      window.mt_saveSuperSession?.();
+      window.mt_showSelector?.();
+
+    } catch(e) {
+      // Fall back to local super admin if server fails
+      console.warn('[Cloud] Server super login failed, trying local:', e.message);
+      _origSuperLogin?.();
+    }
+  };
+
+  // ── Patch mt_saveTenant() ───────────────────────────────────
+  // Save new/edited stations to server in addition to localStorage
+  const _origSaveTenant = window.mt_saveTenant;
+  window.mt_saveTenant = async function(isEdit) {
+    // Run original first (saves to localStorage)
+    await _origSaveTenant?.(isEdit);
+
+    // Then sync to server if super admin cloud JWT exists
+    const superToken = localStorage.getItem('fb_super_cloud_jwt');
+    if (!superToken) return;
+
+    const name = document.getElementById('tName')?.value?.trim();
+    if (!name) return;
+
+    const tenants = JSON.parse(localStorage.getItem('fb_tenants')||'[]');
+    const t = tenants.find(x => x.name === name);
+    if (!t) return;
+
+    try {
+      await api('POST', '/api/super/stations', { token: superToken, tenant: t });
+      console.info('[Cloud] Station saved to server:', t.name);
+    } catch(e) {
+      console.warn('[Cloud] Could not sync station to server:', e.message);
+    }
+  };
+
+  // ── If JWT exists, restore session after app initialises ────
+  if (window._cloudJwtPayload) {
+    // loadData() will be called by initApp → it will fetch server data
+    // Also pre-set session flags so loadSession() succeeds
+    const payload = window._cloudJwtPayload;
+    window.APP.loggedIn  = true;
+    window.APP.role      = 'admin';
+    window.APP.adminUser = { id:payload.userId, name:payload.name, role:payload.role };
+    window.saveSession?.();
+  }
+
+  // ── Auto-refresh every 60s ──────────────────────────────────
   setInterval(async () => {
     if (!Token.get() || !window.APP?.loggedIn) return;
     try {
       await cloudLoad();
       if (window.renderPage && window.APP.page) window.renderPage();
-      console.info('[Cloud] Auto-refreshed');
-    } catch(e) { /* offline */ }
+    } catch {}
   }, 60000);
-}
 
-// ═══════════════════════════════════════════════════════════════
-// THE KEY FIX: Intercept document.addEventListener
-// When app.js does: document.addEventListener('DOMContentLoaded', cb)
-// we wrap cb with our bootstrap so localStorage is seeded FIRST.
-// ═══════════════════════════════════════════════════════════════
-
-if (IS_CLOUD) {
-  const _origAddEL = document.addEventListener.bind(document);
-
-  document.addEventListener = function(type, listener, options) {
-    if (type === 'DOMContentLoaded') {
-      // Restore original immediately so we don't double-wrap
-      document.addEventListener = _origAddEL;
-
-      const wrappedListener = async function(e) {
-        try {
-          await _cloudBootstrap();
-        } catch(err) {
-          console.warn('[Cloud] Bootstrap failed, continuing:', err.message);
-        }
-        // Now run app.js's original DOMContentLoaded → initApp()
-        listener(e);
-      };
-      return _origAddEL(type, wrappedListener, options);
-    }
-    return _origAddEL(type, listener, options);
-  };
-
-  console.info('[FuelBunk] Cloud adapter v5 — DOMContentLoaded intercepted');
-}
-
-// ── Bootstrap: seeds localStorage, overrides doAdminLogin ─────
-async function _cloudBootstrap() {
-  console.info('[Cloud] Bootstrap starting...');
-
-  // 1. Fetch public tenant list and seed localStorage
-  try {
-    const tenants = await apiFetch('GET', '/api/tenants/public');
-    if (tenants && tenants.length > 0) {
-      const list = tenants.map(t => ({
-        id:         t.id,
-        name:       t.name,
-        location:   t.location || '',
-        omc:        t.omc || '',
-        icon:       '⛽',
-        color:      '#d4940f',
-        colorLight: '#f7cc6b',
-        active:     t.is_active !== 0,
-        adminUsers: [
-          // Sentinel entry — cloud auth handles real password check
-          // Having at least one entry stops app showing "no users" error
-          { id: 1, name: 'Admin', username: '_cloud_auth_', passHash: '', role: 'Owner' }
-        ],
-      }));
-
-      localStorage.setItem('fb_tenants', JSON.stringify(list));
-
-      // Auto-select if single tenant
-      if (list.length === 1) {
-        localStorage.setItem('fb_active_tenant', JSON.stringify(list[0]));
-      }
-      console.info('[Cloud] Seeded', list.length, 'tenant(s) into localStorage');
-    }
-  } catch(e) {
-    console.warn('[Cloud] Could not fetch tenants:', e.message);
-  }
-
-  // 2. If JWT exists, pre-load data so app.js finds it immediately
-  if (Token.get()) {
-    try {
-      await cloudLoad();
-
-      // Decode token to restore session
-      const payload = JSON.parse(atob(Token.get().split('.')[1]));
-      const tenantObj = JSON.parse(localStorage.getItem('fb_active_tenant') || 'null')
-                     || { id: payload.tenantId, name: payload.name || 'Station' };
-
-      localStorage.setItem('fb_active_tenant', JSON.stringify(tenantObj));
-
-      // Pre-set APP state so loadSession() restores correctly
-      // We save a fake signed session that the app will pick up
-      window._cloudAuthPayload = payload;
-      console.info('[Cloud] Pre-loaded data for', payload.name);
-    } catch(e) {
-      console.warn('[Cloud] Pre-load failed (token may be expired):', e.message);
-      Token.clear();
-    }
-  }
-
-  // 3. Override doAdminLogin AFTER app.js defines it
-  //    We use setTimeout(0) to let app.js finish parsing, then patch
-  setTimeout(() => {
-    _patchLoginFunction();
-    _patchLoadData();
-    startAutoRefresh();
-  }, 0);
-}
-
-// ── Patch doAdminLogin to use server auth ──────────────────────
-function _patchLoginFunction() {
-  window.doAdminLogin = async function() {
-    const uEl = document.getElementById('adminUser');
-    const pEl = document.getElementById('adminPass');
-    const u   = (uEl?.value || '').trim().toLowerCase();
-    const p   = pEl?.value || '';
-    if (!u || !p) { window.toast?.('Enter credentials', 'error'); return; }
-
-    const tenant = window.mt_getActiveTenant?.();
-    if (!tenant?.id) { window.toast?.('Select a station first', 'error'); return; }
-
-    // Show loading
-    const btn = document.querySelector('.login-btn, button[onclick*="doAdminLogin"]');
-    if (btn) { btn.disabled = true; btn.textContent = 'Signing in...'; }
-
-    try {
-      const result = await apiFetch('POST', '/api/auth/login', {
-        tenantId: tenant.id,
-        username: u,
-        password: p,
-      });
-
-      Token.set(result.token);
-
-      // Load fresh data from server
-      await cloudLoad();
-
-      // Set app session state
-      window.APP.loggedIn  = true;
-      window.APP.role      = 'admin';
-      window.APP.adminUser = { id: result.user.id, name: result.user.name, role: result.user.role };
-      window.APP.tenant    = { ...tenant, ...result.tenant };
-
-      window.saveSession?.();
-      window.enterApp?.();
-      window.auditLog?.('login', { username: u, role: result.user.role });
-      window.toast?.('Welcome ' + result.user.name + '!', 'success');
-
-    } catch(e) {
-      window.toast?.(e.message.includes('Invalid') ? 'Invalid username or password' : e.message, 'error');
-      if (btn) { btn.disabled = false; btn.textContent = 'Login'; }
-    }
-  };
-
-  // Also patch loadSession to restore cloud session
-  // If we have a valid JWT + pre-loaded data, restore session automatically
-  if (window._cloudAuthPayload && window.APP) {
-    const payload = window._cloudAuthPayload;
-    window.APP.loggedIn  = true;
-    window.APP.role      = 'admin';
-    window.APP.adminUser = { id: payload.userId, name: payload.name, role: payload.role };
-    window.saveSession?.();
-    console.info('[Cloud] Session restored from JWT for', payload.name);
-  }
-
-  console.info('[Cloud] doAdminLogin patched');
-}
-
-// ── Patch loadData to use server ───────────────────────────────
-function _patchLoadData() {
-  window.loadData = async function() {
-    // Apply any data already fetched during bootstrap
-    if (window._cloudPendingData && window.APP) {
-      window.APP.data     = window._cloudPendingData;
-      window.APP.auditLog = [];
-      if (window._cloudPendingTenant)
-        window.APP.tenant = { ...(window.APP.tenant||{}), ...window._cloudPendingTenant };
-      window._cloudPendingData   = null;
-      window._cloudPendingTenant = null;
-      console.info('[Cloud] Applied pre-fetched data');
-      return;
-    }
-    if (!Token.get()) return;
-    await cloudLoad();
-  };
-  console.info('[Cloud] loadData patched');
-}
+  console.info('[Cloud] v6 patches applied');
+});
 
 </script>
 <script>

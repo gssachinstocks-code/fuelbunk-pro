@@ -544,6 +544,74 @@ app.post('/api/tenants', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// =============================================================
+// SUPER ADMIN (server-side, own credentials)
+// =============================================================
+
+// Super admin credentials stored in env or defaults
+const SUPER_CREDS = {
+  username: process.env.SUPER_USERNAME || 'superadmin',
+  password: process.env.SUPER_PASSWORD || 'FuelBunk@Super2026',
+};
+const SUPER_JWT_SECRET = JWT_SECRET + '_super';
+
+app.post('/api/super/login', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (username.toLowerCase() !== SUPER_CREDS.username.toLowerCase() ||
+      password !== SUPER_CREDS.password)
+    return res.status(401).json({ error: 'Invalid super admin credentials' });
+
+  const token = jwt.sign({ role: 'SuperAdmin', username }, SUPER_JWT_SECRET, { expiresIn: '8h' });
+  res.json({ token, username });
+});
+
+// Create or update a station from super admin
+app.post('/api/super/stations', (req, res) => {
+  const { token, tenant } = req.body;
+  if (!token || !tenant?.id) return res.status(400).json({ error: 'token and tenant required' });
+
+  try { jwt.verify(token, SUPER_JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Invalid super token' }); }
+
+  const { id, name, location, omc, adminUsers } = tenant;
+
+  // Upsert tenant
+  db.prepare(`INSERT INTO tenants (id,name,location,omc) VALUES (?,?,?,?)
+              ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+              location=excluded.location, omc=excluded.omc`).run(
+    id, name||'Station', location||'', omc||''
+  );
+
+  // Sync admin users (only those with a real passHash from SHA-256 — not the sentinel)
+  if (Array.isArray(adminUsers)) {
+    for (const u of adminUsers) {
+      if (!u.username || !u.passHash || u.username === '_server_' || u.username === '_cloud_auth_') continue;
+      // The app stores SHA-256 hashes; we need bcrypt for the server
+      // Check if user already exists — if so skip to avoid overwriting bcrypt hash
+      const existing = db.prepare('SELECT id FROM admin_users WHERE tenant_id=? AND username=?')
+                         .get(id, u.username);
+      if (!existing) {
+        // New user — we can't convert SHA-256 to bcrypt, so set a temp password
+        // Admin must reset password via server on first login
+        const tempHash = bcrypt.hashSync('admin123', 10);
+        db.prepare(`INSERT OR IGNORE INTO admin_users (tenant_id,username,name,pass_hash,role)
+                    VALUES (?,?,?,?,?)`).run(id, u.username, u.name||'Owner', tempHash, u.role||'Owner');
+      }
+    }
+  }
+
+  // Ensure at least one admin user exists
+  const adminCount = db.prepare('SELECT COUNT(*) as n FROM admin_users WHERE tenant_id=?').get(id).n;
+  if (adminCount === 0) {
+    const hash = bcrypt.hashSync('admin123', 10);
+    db.prepare(`INSERT INTO admin_users (tenant_id,username,name,pass_hash,role) VALUES (?,?,?,?,?)`)
+      .run(id, 'admin', name+' Owner', hash, 'Owner');
+  }
+
+  res.json({ ok: true, id });
+});
+
 // ── Catch-all → frontend ──────────────────────────────────────
 app.get('*', (req, res) => {
   const index = path.join(STATIC_DIR, 'index.html');
