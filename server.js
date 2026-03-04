@@ -523,6 +523,11 @@ app.post('/api/sync', ...auth, (req, res) => {
 // TENANTS (Super Admin)
 // =============================================================
 
+// Public tenant list — no auth needed (used by login screen on new devices)
+app.get('/api/tenants/public', (req, res) => {
+  res.json(db.prepare('SELECT id,name,location,omc,is_active FROM tenants WHERE is_active=1').all());
+});
+
 app.get('/api/tenants', requireAuth, (req, res) => {
   if (req.auth.role !== 'SuperAdmin') return res.status(403).json({ error: 'Forbidden' });
   res.json(db.prepare('SELECT id,name,location,omc,is_active,created_at FROM tenants').all());

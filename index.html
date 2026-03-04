@@ -126,7 +126,7 @@
   try {
     var fill = document.getElementById('splash-bar-fill');
     if (fill) fill.style.width = '20%';
-    document.getElementById('splash-msg').textContent = 'Starting...';
+    document.getElementById('splash-msg').textContent = 'Clearing cache...';
   } catch(e) {}
 
   if ('serviceWorker' in navigator) {
@@ -743,361 +743,399 @@ try {
 } catch(e) {}
 </script>
 <script>
-/* === API ADAPTER === */
+/* === CLOUD API ADAPTER v4 === */
 /**
- * FuelBunk Pro — Cloud API Adapter v2
+ * FuelBunk Pro — Cloud API Adapter v4 (DEFINITIVE)
  *
- * Strategy:
- *  1. Override window.FuelDB SYNCHRONOUSLY so when app.js does
- *     `new FuelDB(...)` it gets CloudDB instead of IndexedDB.
- *  2. Override window.loadData AFTER app.js defines it, so data
- *     is fetched from /api/data instead of IndexedDB.
- *  3. Override doAdminLogin to authenticate against the server.
+ * The problem on new devices:
+ *   - localStorage is empty → no tenant, no admin users, no data
+ *   - ADMIN_USERS array is built at parse time from localStorage → hardcoded demo only
+ *   - Patching after the fact doesn't work
  *
- * This file must be inlined BEFORE app.js in index.html.
+ * The fix:
+ *   - Override window.initApp BEFORE app.js's DOMContentLoaded fires
+ *   - Our initApp: check JWT → show cloud login → auth server → seed localStorage → load data → enterApp()
+ *   - CloudDB class routes all db.put/add/delete to REST API
+ *   - Auto-refresh every 60s for multi-device sync
  */
 
 'use strict';
 
-// ── Detect if we're running on a real server (not file://) ────
 const IS_CLOUD = location.protocol === 'https:' || location.protocol === 'http:';
-const API_BASE = '';  // same origin
 
-// ── Token store ───────────────────────────────────────────────
+// ── Token ──────────────────────────────────────────────────────
 const Token = {
-  get()    { try { return localStorage.getItem('fb_cloud_token'); }     catch { return null; } },
-  set(t)   { try { localStorage.setItem('fb_cloud_token', t); }         catch {} },
-  clear()  { try { localStorage.removeItem('fb_cloud_token'); }         catch {} },
-  headers(){ const t = this.get();
-             return { 'Content-Type': 'application/json',
-                      ...(t ? { Authorization: 'Bearer ' + t } : {}) }; }
+  KEY: 'fb_cloud_jwt',
+  get()   { try{return localStorage.getItem(this.KEY);}catch{return null;} },
+  set(t)  { try{localStorage.setItem(this.KEY,t);}catch{} },
+  clear() { try{localStorage.removeItem(this.KEY);}catch{} },
+  hdrs()  { const t=this.get();
+             return {'Content-Type':'application/json',
+                     ...(t?{Authorization:'Bearer '+t}:{})}; }
 };
 
-// ── Core API fetch ────────────────────────────────────────────
-async function apiFetch(method, path, body) {
-  const r = await fetch(API_BASE + path, {
-    method,
-    headers: Token.headers(),
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {})
-  });
-  if (r.status === 401) { Token.clear(); location.reload(); throw new Error('Session expired'); }
-  if (!r.ok) { const t = await r.text(); throw new Error('API ' + r.status + ': ' + t); }
-  return r.json();
+// ── API fetch ──────────────────────────────────────────────────
+async function api(method, path, body) {
+  try {
+    const r = await fetch(path, {
+      method, headers: Token.hdrs(),
+      ...(body!==undefined?{body:JSON.stringify(body)}:{})
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(txt || r.status);
+    }
+    return r.json();
+  } catch(e) {
+    throw e;
+  }
 }
-const api = {
-  get:    p     => apiFetch('GET',    p),
-  post:   (p,b) => apiFetch('POST',   p, b),
-  put:    (p,b) => apiFetch('PUT',    p, b),
-  delete: p     => apiFetch('DELETE', p),
-};
 
-// ── Cloud login ───────────────────────────────────────────────
-window.cloudLogin = async function(tenantId, username, password) {
-  const r = await api.post('/api/auth/login', { tenantId, username, password });
-  Token.set(r.token);
-  return r;
-};
-window.cloudLogout = function() { Token.clear(); };
-window.cloudToken  = Token;
-
-// ═══════════════════════════════════════════════════════════════
-// CloudDB — same interface as FuelDB but talks to REST API
-// ═══════════════════════════════════════════════════════════════
+// ── CloudDB — mirrors FuelDB interface ─────────────────────────
 class CloudDB {
-  constructor() {
-    this.db    = true;       // truthy — app checks `if (db && db.db)`
-    this.ready = Promise.resolve();
-  }
+  constructor(){ this.db=true; this.ready=Promise.resolve(); }
 
-  // ── In-memory helpers ─────────────────────────────────────
-  _arr(store) {
-    const d = window.APP?.data;
-    if (!d) return null;
-    const map = {
-      tanks:'tanks', pumps:'pumps', sales:'sales', employees:'employees',
-      shifts:'shifts', creditCustomers:'creditCustomers', expenses:'expenses',
-      fuelPurchases:'fuelPurchases', dipReadings:'dipReadings',
-    };
-    return d[map[store]] || null;
+  _arr(s){
+    const d=window.APP?.data; if(!d) return null;
+    const m={tanks:'tanks',pumps:'pumps',sales:'sales',employees:'employees',
+             shifts:'shifts',creditCustomers:'creditCustomers',expenses:'expenses',
+             fuelPurchases:'fuelPurchases',dipReadings:'dipReadings'};
+    return d[m[s]]||null;
   }
-  _upsert(store, data) {
-    const a = this._arr(store); if (!a) return;
-    const i = a.findIndex(r => r.id === data.id);
-    if (i >= 0) a[i] = { ...a[i], ...data }; else a.unshift(data);
-  }
-  _insert(store, data) { const a = this._arr(store); if (a) a.unshift(data); }
-  _remove(store, key)  { const a = this._arr(store); if (!a) return;
-                         const i = a.findIndex(r => r.id === key);
-                         if (i >= 0) a.splice(i, 1); }
+  _up(s,v){ const a=this._arr(s);if(!a)return;
+            const i=a.findIndex(r=>r.id===v.id);
+            if(i>=0)a[i]={...a[i],...v};else a.unshift(v); }
+  _in(s,v){ const a=this._arr(s);if(a)a.unshift(v); }
+  _rm(s,k){ const a=this._arr(s);if(!a)return;
+            const i=a.findIndex(r=>r.id===k);if(i>=0)a.splice(i,1); }
 
-  // ── FuelDB interface ──────────────────────────────────────
-  async getAll(store) {
-    const a = this._arr(store);
-    if (a) return a;
-    if (store === 'settings') {
-      const d = window.APP?.data;
-      if (!d) return [];
-      return Object.entries(d.settings || {}).map(([key,value]) => ({ key, value }));
+  async getAll(s){
+    if(s==='settings'){
+      const d=window.APP?.data;if(!d)return[];
+      return Object.entries(d.settings||{}).map(([k,v])=>({key:k,value:v}));
     }
-    if (store === 'auditLog') return window.APP?.auditLog || [];
-    return [];
+    if(s==='auditLog') return window.APP?.auditLog||[];
+    return this._arr(s)||[];
   }
-
-  async get(store, key) {
-    if (store === 'settings') {
-      const d = window.APP?.data?.settings;
-      if (d && d[key] !== undefined) return { key, value: d[key] };
-      return null;
+  async get(s,k){
+    if(s==='settings'){
+      const v=window.APP?.data?.settings?.[k];
+      return v!==undefined?{key:k,value:v}:null;
     }
-    const a = this._arr(store);
-    return a ? (a.find(r => r.id === key) || null) : null;
+    const a=this._arr(s);return a?(a.find(r=>r.id===k)||null):null;
+  }
+  async put(s,v){  this._up(s,v); this._write(s,v,'put'); return v.id; }
+  async add(s,v){  this._in(s,v); this._write(s,v,'add'); return v.id; }
+  async delete(s,k){ this._rm(s,k); this._del(s,k); }
+  async clear(){}
+  async count(s){ return(await this.getAll(s)).length; }
+  async bulkPut(s,items){
+    items.forEach(v=>this._up(s,v));
+    if(s==='sales') api('POST','/api/sales/batch',{sales:items}).catch(()=>{});
+    else items.forEach(v=>this._write(s,v,'put'));
+  }
+  async getByIndex(s,idx,val){
+    return(await this.getAll(s)).filter(r=>r[idx]===val);
+  }
+  async getSetting(k,def=null){
+    const v=window.APP?.data?.settings?.[k];
+    if(v!==undefined)return v;
+    try{const r=await api('GET','/api/settings/'+encodeURIComponent(k));return r?.value??def;}
+    catch{return def;}
+  }
+  async setSetting(k,v){
+    if(window.APP?.data?.settings)window.APP.data.settings[k]=v;
+    api('PUT','/api/settings/'+encodeURIComponent(k),{value:v}).catch(()=>{});
   }
 
-  async put(store, data) {
-    this._upsert(store, data);
-    this._cloudWrite(store, data, 'put');
-    return data.id;
-  }
-
-  async add(store, data) {
-    this._insert(store, data);
-    this._cloudWrite(store, data, 'add');
-    return data.id;
-  }
-
-  async delete(store, key) {
-    this._remove(store, key);
-    this._cloudDelete(store, key);
-  }
-
-  async clear(store) {
-    console.warn('[CloudDB] clear() on', store, '— not implemented for cloud');
-  }
-
-  async bulkPut(store, items) {
-    items.forEach(item => this._upsert(store, item));
-    if (store === 'sales') {
-      api.post('/api/sales/batch', { sales: items }).catch(e => console.warn('[CloudDB]', e.message));
-    } else {
-      items.forEach(item => this._cloudWrite(store, item, 'put'));
-    }
-  }
-
-  async count(store) { return (await this.getAll(store)).length; }
-
-  async getSetting(key, def = null) {
-    const d = window.APP?.data?.settings;
-    if (d && d[key] !== undefined) return d[key];
-    try {
-      const r = await api.get('/api/settings/' + encodeURIComponent(key));
-      return r.value !== null ? r.value : def;
-    } catch { return def; }
-  }
-
-  async setSetting(key, value) {
-    if (window.APP?.data?.settings) window.APP.data.settings[key] = value;
-    api.put('/api/settings/' + encodeURIComponent(key), { value }).catch(() => {});
-  }
-
-  async getByIndex(store, idx, val) {
-    const a = await this.getAll(store);
-    return a.filter(r => r[idx] === val);
-  }
-
-  // ── Cloud write router ───────────────────────────────────
-  _cloudWrite(store, data, op) {
-    const go = () => {
-      switch(store) {
-        case 'tanks':
-          return op === 'add'
-            ? api.post('/api/tanks', data)
-            : api.put('/api/tanks/' + data.id, data);
-        case 'pumps':
-          return op === 'add'
-            ? api.post('/api/pumps', data)
-            : api.put('/api/pumps/' + data.id, data);
-        case 'employees':
-          return op === 'add'
-            ? api.post('/api/employees', data)
-            : api.put('/api/employees/' + data.id, data);
-        case 'shifts':
-          return op === 'add'
-            ? api.post('/api/shifts', data)
-            : api.put('/api/shifts/' + data.id, data);
-        case 'creditCustomers':
-          return op === 'add'
-            ? api.post('/api/credit_customers', data)
-            : api.put('/api/credit_customers/' + data.id, data);
-        case 'sales':          return api.post('/api/sales', data);
-        case 'expenses':       return api.post('/api/expenses', data);
-        case 'fuelPurchases':  return api.post('/api/fuel_purchases', data);
-        case 'dipReadings':    return api.post('/api/dip_readings', data);
-        case 'auditLog':       return api.post('/api/audit', { action: data.action, details: data });
-        case 'settings':
-          return api.put('/api/settings/' + encodeURIComponent(data.key), { value: data.value });
-        default: return Promise.resolve();
-      }
+  _write(s,v,op){
+    const routes={
+      tanks:          op==='add'?['/api/tanks','POST']          :['/api/tanks/'+v.id,'PUT'],
+      pumps:          op==='add'?['/api/pumps','POST']          :['/api/pumps/'+v.id,'PUT'],
+      employees:      op==='add'?['/api/employees','POST']      :['/api/employees/'+v.id,'PUT'],
+      shifts:         op==='add'?['/api/shifts','POST']         :['/api/shifts/'+v.id,'PUT'],
+      creditCustomers:op==='add'?['/api/credit_customers','POST']:['/api/credit_customers/'+v.id,'PUT'],
+      sales:          ['/api/sales','POST'],
+      expenses:       ['/api/expenses','POST'],
+      fuelPurchases:  ['/api/fuel_purchases','POST'],
+      dipReadings:    ['/api/dip_readings','POST'],
+      auditLog:       ['/api/audit','POST'],
+      settings:       ['/api/settings/'+encodeURIComponent(v?.key||''),'PUT'],
     };
-    go().catch(e => console.warn('[CloudDB write]', store, e.message));
+    const r=routes[s];if(!r)return;
+    const body=s==='auditLog'?{action:v.action,details:v}
+              :s==='settings'?{value:v.value}:v;
+    api(r[1],r[0],body).catch(e=>console.warn('[DB]',s,e.message));
   }
-
-  _cloudDelete(store, key) {
-    const routes = {
-      tanks: '/api/tanks/', pumps: '/api/pumps/', employees: '/api/employees/',
-      creditCustomers: '/api/credit_customers/', expenses: '/api/expenses/',
-    };
-    if (routes[store]) api.delete(routes[store] + key).catch(e => console.warn('[CloudDB delete]', e.message));
+  _del(s,k){
+    const m={tanks:'/api/tanks/',pumps:'/api/pumps/',employees:'/api/employees/',
+             creditCustomers:'/api/credit_customers/',expenses:'/api/expenses/'};
+    if(m[s])api('DELETE',m[s]+k).catch(()=>{});
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// SYNCHRONOUS OVERRIDE — runs before app.js
-// When app.js does `new FuelDB(...)`, it gets CloudDB instead.
-// ═══════════════════════════════════════════════════════════════
+// Replace FuelDB before app.js uses it
+if(IS_CLOUD) window.FuelDB = CloudDB;
 
-if (IS_CLOUD) {
-  // Override the FuelDB class BEFORE app.js defines window.db
-  window.FuelDB = CloudDB;
-  console.info('[FuelBunk] CloudDB adapter active — all data will sync to server');
+// ── Load all data from server into APP.data ────────────────────
+async function cloudLoad(){
+  const d = await api('GET','/api/data');
+  window.APP.data = {
+    tanks:           d.tanks           ||[],
+    pumps:           d.pumps           ||[],
+    shifts:          d.shifts          ||[],
+    employees:       d.employees       ||[],
+    sales:           (d.sales          ||[]).sort((a,b)=>b.id-a.id),
+    creditCustomers: d.creditCustomers ||[],
+    expenses:        (d.expenses       ||[]).sort((a,b)=>b.id-a.id),
+    fuelPurchases:   (d.fuelPurchases  ||[]).sort((a,b)=>b.id-a.id),
+    dipReadings:     (d.dipReadings    ||[]).sort((a,b)=>b.id-a.id),
+    prices:          d.prices          ||window.SEED?.prices         ||{},
+    purchasePrices:  d.purchasePrices  ||window.SEED?.purchasePrices ||{},
+    upiVPA:          d.settings?.upiVPA    ||d.tenant?.upi_vpa    ||'',
+    upiName:         d.settings?.upiName   ||d.tenant?.name       ||'',
+    stationCode:     d.settings?.stationCode||d.tenant?.station_code||'',
+    omcName:         d.settings?.omcName   ||d.tenant?.omc        ||'',
+    razorpayKey:     d.settings?.razorpayKey||'',
+    weekly: [],
+    settings: d.settings||{},
+  };
+  if(d.tenant) window.APP.tenant={...window.APP.tenant,...d.tenant};
+  window.APP.auditLog=[];
+  console.info('[Cloud] Loaded — tanks:',d.tanks?.length,'sales:',d.sales?.length);
 }
 
 // ═══════════════════════════════════════════════════════════════
-// POST-LOAD HOOKS — run after app.js has finished loading
-// Override loadData() and login functions to use the API.
+// CLOUD LOGIN SCREEN
+// Shows before initApp on new devices — asks for
+// Station ID + Username + Password, auths server, seeds localStorage
 // ═══════════════════════════════════════════════════════════════
 
-window.addEventListener('load', function() {
-  if (!IS_CLOUD) return;
+function showCloudLogin(onSuccess){
+  document.body.classList.add('app-ready');
+  const app = document.getElementById('app')||document.body;
 
-  // ── 1. Override loadData to fetch from /api/data ───────────
-  window.loadData = async function() {
-    const token = Token.get();
-    if (!token) {
-      // No token yet — let login flow handle it, use SEED for now
-      console.info('[CloudDB] No token yet — waiting for login');
+  app.innerHTML = `
+  <div id="cloudLogin" style="position:fixed;inset:0;background:#0a0c10;display:flex;align-items:center;justify-content:center;padding:20px;z-index:99999;font-family:'Inter','Segoe UI',sans-serif">
+    <div style="background:#12141a;border:1px solid #23262e;border-radius:18px;padding:32px 28px;width:100%;max-width:380px;box-shadow:0 24px 60px rgba(0,0,0,0.6)">
+      <!-- Logo -->
+      <div style="text-align:center;margin-bottom:28px">
+        <div style="width:60px;height:60px;border-radius:16px;background:linear-gradient(135deg,#d4940f,#f7cc6b);display:grid;place-items:center;font-size:26px;margin:0 auto 12px">⛽</div>
+        <h1 style="font-size:20px;font-weight:900;color:#f4f5f7;margin:0 0 4px">FuelBunk Pro</h1>
+        <p style="font-size:12px;color:#6b7280;margin:0">Sign in to your station</p>
+      </div>
+
+      <!-- Error box -->
+      <div id="cloudErr" style="display:none;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:8px;padding:10px 14px;font-size:13px;color:#f87171;margin-bottom:16px"></div>
+
+      <!-- Fields -->
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;font-weight:700;color:#9498a5;display:block;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Station ID</label>
+        <input id="cl_tenant" type="text" value="demo_station"
+          style="width:100%;box-sizing:border-box;background:#1a1d24;border:1px solid #2d3139;border-radius:9px;padding:11px 14px;font-size:14px;color:#f4f5f7;outline:none"
+          placeholder="e.g. demo_station" />
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;font-weight:700;color:#9498a5;display:block;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Username</label>
+        <input id="cl_user" type="text" autocomplete="username"
+          style="width:100%;box-sizing:border-box;background:#1a1d24;border:1px solid #2d3139;border-radius:9px;padding:11px 14px;font-size:14px;color:#f4f5f7;outline:none"
+          placeholder="admin" />
+      </div>
+      <div style="margin-bottom:22px">
+        <label style="font-size:11px;font-weight:700;color:#9498a5;display:block;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px">Password</label>
+        <input id="cl_pass" type="password" autocomplete="current-password"
+          style="width:100%;box-sizing:border-box;background:#1a1d24;border:1px solid #2d3139;border-radius:9px;padding:11px 14px;font-size:14px;color:#f4f5f7;outline:none"
+          placeholder="••••••••"
+          onkeydown="if(event.key==='Enter')window._cloudDoLogin()" />
+      </div>
+
+      <!-- Button -->
+      <button id="cl_btn" onclick="window._cloudDoLogin()"
+        style="width:100%;background:linear-gradient(135deg,#d4940f,#f7cc6b);color:#000;border:none;border-radius:10px;padding:13px;font-size:15px;font-weight:800;cursor:pointer;letter-spacing:0.3px">
+        Sign In →
+      </button>
+
+      <p style="text-align:center;font-size:11px;color:#4b5563;margin-top:18px;margin-bottom:0">
+        Default: demo_station / admin / admin123
+      </p>
+    </div>
+  </div>`;
+
+  // Focus username
+  setTimeout(()=>{
+    const el = document.getElementById('cl_user');
+    if(el) el.focus();
+  }, 100);
+
+  window._cloudDoLogin = async function(){
+    const tenantId = (document.getElementById('cl_tenant')?.value||'').trim();
+    const username = (document.getElementById('cl_user')?.value||'').trim().toLowerCase();
+    const password = document.getElementById('cl_pass')?.value||'';
+    const btn      = document.getElementById('cl_btn');
+    const errEl    = document.getElementById('cloudErr');
+
+    if(!tenantId||!username||!password){
+      errEl.textContent='Please fill all fields.';
+      errEl.style.display='block';
       return;
     }
-    try {
-      console.info('[CloudDB] Loading data from server...');
-      const d = await api.get('/api/data');
 
-      // Merge server data into APP.data
-      window.APP.data = {
-        tanks:           d.tanks           || [],
-        pumps:           d.pumps           || [],
-        shifts:          d.shifts          || [],
-        employees:       d.employees       || [],
-        sales:           (d.sales          || []).sort((a,b) => b.id - a.id),
-        creditCustomers: d.creditCustomers || [],
-        expenses:        (d.expenses       || []).sort((a,b) => b.id - a.id),
-        fuelPurchases:   (d.fuelPurchases  || []).sort((a,b) => b.id - a.id),
-        dipReadings:     (d.dipReadings    || []).sort((a,b) => b.id - a.id),
-        prices:          d.prices          || window.SEED?.prices          || {},
-        purchasePrices:  d.purchasePrices  || window.SEED?.purchasePrices  || {},
-        upiVPA:          d.settings?.upiVPA    || d.tenant?.upi_vpa    || '',
-        upiName:         d.settings?.upiName   || d.tenant?.name       || '',
-        stationCode:     d.settings?.stationCode || d.tenant?.station_code || '',
-        omcName:         d.settings?.omcName   || d.tenant?.omc        || '',
-        razorpayKey:     d.settings?.razorpayKey || '',
-        weekly:          [],
-        settings:        d.settings        || {},
+    btn.disabled=true;
+    btn.textContent='Signing in...';
+    errEl.style.display='none';
+
+    try {
+      const result = await api('POST','/api/auth/login',{tenantId,username,password});
+      Token.set(result.token);
+
+      // Seed localStorage so the app's own tenant/session system works
+      const tenantObj = {
+        id:         result.tenant.id,
+        name:       result.tenant.name,
+        location:   result.tenant.location||'',
+        omc:        result.tenant.omc||'',
+        icon:       '⛽',
+        color:      '#d4940f',
+        colorLight: '#f7cc6b',
+        active:     true,
+        adminUsers: [],  // passwords never sent to client
       };
+      // Save tenant list and active tenant
+      const existing = JSON.parse(localStorage.getItem('fb_tenants')||'[]');
+      if(!existing.find(t=>t.id===tenantObj.id)) existing.push(tenantObj);
+      localStorage.setItem('fb_tenants', JSON.stringify(existing));
+      localStorage.setItem('fb_active_tenant', JSON.stringify(tenantObj));
 
-      // Update APP.tenant with server data
-      if (d.tenant) {
-        window.APP.tenant = { ...window.APP.tenant, ...d.tenant };
-      }
+      // Remove cloud login UI
+      const cl = document.getElementById('cloudLogin');
+      if(cl) cl.remove();
 
-      console.info('[CloudDB] Data loaded — tanks:', d.tanks?.length,
-                   'sales:', d.sales?.length, 'employees:', d.employees?.length);
+      // Load all data from server
+      await cloudLoad();
+
+      // Set app auth state — bypasses ADMIN_USERS check
+      window.APP.loggedIn  = true;
+      window.APP.role      = 'admin';
+      window.APP.adminUser = {id:result.user.id, name:result.user.name, role:result.user.role};
+      window.APP.tenant    = tenantObj;
+
+      // Call the callback (enterApp + renderPage)
+      onSuccess(result);
+
     } catch(e) {
-      console.error('[CloudDB] loadData failed:', e.message);
-      throw e;
+      errEl.textContent = e.message.includes('401')||e.message.toLowerCase().includes('invalid')
+        ? 'Invalid Station ID, username, or password.'
+        : 'Server error: '+e.message;
+      errEl.style.display='block';
+      btn.disabled=false;
+      btn.textContent='Sign In →';
     }
   };
+}
 
-  // ── 2. Override doAdminLogin to authenticate via API ────────
-  //    then reload data from server after successful login
-  const _origLogin = window.doAdminLogin;
-  window.doAdminLogin = async function() {
-    // Get the tenant from the multi-tenant selector
-    const tenant = window.mt_getActiveTenant ? window.mt_getActiveTenant() : null;
-    const tenantId = tenant?.id || 'demo_station';
+// ═══════════════════════════════════════════════════════════════
+// INTERCEPT initApp — our version runs first
+// ═══════════════════════════════════════════════════════════════
 
-    // Try to get credentials from the login form
-    const usernameEl = document.getElementById('adminUser') || document.getElementById('loginUser');
-    const passwordEl = document.getElementById('adminPass') || document.getElementById('loginPass');
-    const username   = usernameEl?.value?.trim() || '';
-    const password   = passwordEl?.value || '';
+if(IS_CLOUD){
 
-    if (!username || !password) {
-      // Fall through to original (handles its own validation errors)
-      if (_origLogin) return _origLogin.apply(this, arguments);
-      return;
-    }
+  // Override initApp before app.js DOMContentLoaded fires
+  // app.js does: document.addEventListener('DOMContentLoaded', () => initApp())
+  // We override window.initApp here; app.js calls window.initApp() indirectly
+  // so our version runs.
+  //
+  // We use a flag to prevent re-entry.
+  let _booted = false;
 
-    try {
-      const result = await window.cloudLogin(tenantId, username, password);
-      console.info('[CloudDB] Logged in to server as', result.user?.name);
+  window.initApp = async function initApp(){
+    if(_booted) return;
 
-      // Now load fresh data from server
-      await window.loadData();
+    const token = Token.get();
 
-      // Continue with original local login (session, role assignment etc.)
-      if (_origLogin) {
-        // Pre-fill so original login validation passes
-        // Original reads same form fields — just call it
-        _origLogin.apply(this, arguments);
-      }
-    } catch(err) {
-      // Server auth failed — show error but still allow local login for offline fallback
-      console.warn('[CloudDB] Server login failed:', err.message);
-      // Show toast if available
-      if (window.toast) window.toast('Server: ' + err.message, 'error');
-      // Still try local login (offline mode)
-      if (_origLogin) _origLogin.apply(this, arguments);
-    }
-  };
-
-  // ── 3. After enterApp, reload data from server to ensure fresh ──
-  const _origEnterApp = window.enterApp;
-  window.enterApp = async function() {
-    // Call original enterApp first
-    if (_origEnterApp) _origEnterApp.apply(this, arguments);
-
-    // Then refresh data from server if we have a token
-    if (Token.get()) {
+    if(token){
+      // ── Already logged in — just load data and boot ────────
       try {
-        await window.loadData();
-        if (window.renderPage) window.renderPage();
-      } catch(e) {
-        console.warn('[CloudDB] Background refresh failed:', e.message);
+        _splashProgress?.(80,'Loading station...');
+        await cloudLoad();
+
+        // Restore session state
+        window.APP.loggedIn = true;
+        window.APP.role     = 'admin';
+
+        // Try to get user info from token (decode JWT payload)
+        try {
+          const payload = JSON.parse(atob(token.split('.')[1]));
+          window.APP.adminUser = {id:payload.userId, name:payload.name, role:payload.role};
+          window.APP.tenant    = window.APP.tenant || {id:payload.tenantId, name:payload.name};
+        } catch{}
+
+        // Restore localStorage tenant if missing
+        if(!localStorage.getItem('fb_active_tenant') && window.APP.tenant){
+          localStorage.setItem('fb_active_tenant',JSON.stringify(window.APP.tenant));
+        }
+
+        // Save session so loadSession() succeeds
+        window.saveSession?.();
+
+        _splashProgress?.(100,'Ready!');
+        document.body.classList.add('app-ready');
+        _booted = true;
+
+        // Start the app
+        window.updateClock?.(); setInterval(()=>window.updateClock?.(),1000);
+        window.updateOnlineStatus?.();
+        window.enterApp?.();
+
+        // Auto-refresh every 60s
+        _startAutoRefresh();
+        // Override loadData for any future calls
+        window.loadData = async()=>{ await cloudLoad(); };
+        return;
+
+      } catch(e){
+        // Token expired or server error — clear and show login
+        console.warn('[Cloud] Token invalid:',e.message);
+        Token.clear();
       }
     }
+
+    // ── No token — show our cloud login screen ─────────────────
+    _splashProgress?.(100,'');
+    document.body.classList.add('app-ready');
+    _booted = true;
+
+    showCloudLogin(async (loginResult)=>{
+      // Save session
+      window.saveSession?.();
+
+      // Start clock etc.
+      window.updateClock?.(); setInterval(()=>window.updateClock?.(),1000);
+      window.updateOnlineStatus?.();
+
+      // Enter the app
+      window.enterApp?.();
+      window.toast?.('Welcome '+loginResult.user.name+'!','success');
+
+      // Auto-refresh every 60s
+      _startAutoRefresh();
+      // Override loadData for future calls
+      window.loadData = async()=>{ await cloudLoad(); };
+    });
   };
 
-  // ── 4. Periodically sync data from server every 60s ─────────
-  //    (so if another device makes changes, this device sees them)
-  setInterval(async () => {
-    if (!Token.get()) return;
-    if (!window.APP?.data) return;
-    try {
-      const d = await api.get('/api/data');
-      if (!d) return;
-      // Merge fresh data
-      window.APP.data.tanks           = d.tanks           || window.APP.data.tanks;
-      window.APP.data.sales           = (d.sales||[]).sort((a,b) => b.id - a.id) || window.APP.data.sales;
-      window.APP.data.expenses        = (d.expenses||[]).sort((a,b) => b.id - a.id) || window.APP.data.expenses;
-      window.APP.data.fuelPurchases   = (d.fuelPurchases||[]).sort((a,b) => b.id-a.id) || window.APP.data.fuelPurchases;
-      window.APP.data.creditCustomers = d.creditCustomers || window.APP.data.creditCustomers;
-      window.APP.data.employees       = d.employees       || window.APP.data.employees;
-      if (window.renderPage && window.APP?.page) window.renderPage();
-      console.info('[CloudDB] Auto-synced from server');
-    } catch(e) { /* silent — offline */ }
-  }, 60000); // every 60 seconds
+  function _startAutoRefresh(){
+    setInterval(async()=>{
+      if(!Token.get()||!window.APP?.loggedIn) return;
+      try{
+        await cloudLoad();
+        if(window.renderPage&&window.APP.page) window.renderPage();
+        console.info('[Cloud] Auto-refreshed');
+      }catch(e){ console.warn('[Cloud] Refresh failed:',e.message); }
+    }, 60000);
+  }
 
-  console.info('[CloudDB] Post-load hooks installed');
-});
+  console.info('[FuelBunk] Cloud adapter v4 ready');
+}
 
 </script>
 <script>
