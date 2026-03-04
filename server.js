@@ -20,7 +20,7 @@ const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fuelbunk_dev_secret_change_in_prod';
 const JWT_EXPIRY = '12h';
 const DB_PATH    = process.env.DB_PATH || path.join(__dirname, 'data', 'fuelbunk.db');
-const STATIC_DIR = path.join(__dirname, 'public');
+const STATIC_DIR = __dirname;  // index.html lives at root
 
 // ── Ensure data directory exists ─────────────────────────────
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -58,7 +58,15 @@ const app = express();
 app.use(cors({ origin: '*', methods: ['GET','POST','PUT','DELETE','OPTIONS'] }));
 app.use(express.json({ limit: '10mb' }));
 app.use(morgan('tiny'));
-if (fs.existsSync(STATIC_DIR)) app.use(express.static(STATIC_DIR));
+// Serve only specific static files from root (not node_modules etc.)
+app.use(express.static(STATIC_DIR, {
+  index: 'index.html',
+  dotfiles: 'ignore',
+  // Only serve whitelisted extensions
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) res.setHeader('Cache-Control', 'no-cache');
+  }
+}));
 
 // ── Auth middleware ───────────────────────────────────────────
 function requireAuth(req, res, next) {
