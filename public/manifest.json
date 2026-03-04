@@ -1,0 +1,51 @@
+{
+  "name": "FuelBunk Pro \u2014 Fuel Station Management",
+  "short_name": "FuelBunk Pro",
+  "description": "Complete fuel bunk operation and financial management with offline support",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0a0c10",
+  "theme_color": "#d4940f",
+  "categories": [
+    "business",
+    "finance",
+    "utilities"
+  ],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Dashboard",
+      "url": "/",
+      "description": "Management dashboard"
+    },
+    {
+      "name": "Employee Portal",
+      "url": "/#employee",
+      "description": "Employee shift portal"
+    },
+    {
+      "name": "Sales",
+      "url": "/#sales",
+      "description": "View sales log"
+    },
+    {
+      "name": "Staff & Allocation",
+      "url": "/#staff",
+      "description": "Manage pump assignments"
+    }
+  ]
+}
