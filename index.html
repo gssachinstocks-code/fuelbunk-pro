@@ -863,9 +863,10 @@ class CloudDB {
 if (IS_CLOUD) window.FuelDB = CloudDB;
 
 // ── Load all data from /api/data into APP.data ─────────────────
+// Stores result in window._cloudPendingData if APP not ready yet.
 async function cloudLoad() {
   const d = await apiFetch('GET', '/api/data');
-  window.APP.data = {
+  const appData = {
     tanks:           d.tanks           || [],
     pumps:           d.pumps           || [],
     shifts:          d.shifts          || [],
@@ -885,8 +886,14 @@ async function cloudLoad() {
     weekly: [],
     settings: d.settings || {},
   };
-  if (d.tenant) window.APP.tenant = { ...window.APP.tenant, ...d.tenant };
-  window.APP.auditLog = [];
+  // Store pending — applied now if APP ready, or by patched loadData() later
+  window._cloudPendingData   = appData;
+  window._cloudPendingTenant = d.tenant || null;
+  if (window.APP) {
+    window.APP.data     = appData;
+    window.APP.auditLog = [];
+    if (d.tenant) window.APP.tenant = { ...(window.APP.tenant||{}), ...d.tenant };
+  }
   console.info('[Cloud] Data loaded — tanks:', d.tanks?.length, 'sales:', d.sales?.length);
 }
 
@@ -1062,6 +1069,17 @@ function _patchLoginFunction() {
 // ── Patch loadData to use server ───────────────────────────────
 function _patchLoadData() {
   window.loadData = async function() {
+    // Apply any data already fetched during bootstrap
+    if (window._cloudPendingData && window.APP) {
+      window.APP.data     = window._cloudPendingData;
+      window.APP.auditLog = [];
+      if (window._cloudPendingTenant)
+        window.APP.tenant = { ...(window.APP.tenant||{}), ...window._cloudPendingTenant };
+      window._cloudPendingData   = null;
+      window._cloudPendingTenant = null;
+      console.info('[Cloud] Applied pre-fetched data');
+      return;
+    }
     if (!Token.get()) return;
     await cloudLoad();
   };
@@ -4232,6 +4250,7 @@ const APP = {
   auditLog: [],
   salesAllTime: false,
 };
+window.APP = APP; // expose for cloud adapter
 
 // ── SEED DATA ────────────────────────────────────────────────
 const SEED = {
