@@ -1,17 +1,16 @@
 {
   "name": "fuelbunk-pro-backend",
   "version": "1.0.0",
-  "description": "FuelBunk Pro - REST API backend with SQLite",
+  "description": "FuelBunk Pro - REST API backend with built-in SQLite",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.5.0"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.18.2",
